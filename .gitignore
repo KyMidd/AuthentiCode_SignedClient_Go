@@ -1,0 +1,9 @@
+# Local drafts
+blog/
+
+# Build output
+dist/
+bin/
+
+# macOS
+.DS_Store

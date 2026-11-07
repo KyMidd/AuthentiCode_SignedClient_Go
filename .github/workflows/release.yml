@@ -1,0 +1,273 @@
+# Build a Go Windows binary, Authenticode-sign it with a certificate held in
+# Azure Key Vault, then checksum it and publish it to S3.
+#
+# The build job targets Go, but sign and publish only care about the .exe.
+# Any toolchain that produces a Windows PE binary (Rust, .NET, C/C++, ...) works:
+# replace the build steps and keep the output at dist/${BINARY_NAME}.
+#
+# Repository or environment variables (Settings > Secrets and variables > Actions > Variables):
+#   AZURE_CLIENT_ID      Entra app / managed identity with a federated credential for this repo
+#   AZURE_TENANT_ID      Entra tenant ID
+#   AZURE_KEY_VAULT_URL  e.g. https://my-vault.vault.azure.net/
+#   AZURE_CERT_NAME      Code signing certificate name in the vault
+#   AWS_ROLE_ARN         IAM role to assume via OIDC for the S3 upload
+#   AWS_REGION           Region of the bucket
+#   S3_BUCKET            Destination bucket
+#   EXPECTED_CERT_SHA256 Optional. Lowercase hex SHA-256 of the DER signing cert, to pin it.
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  # Build
+  BINARY_NAME: my-app.exe
+  GO_MAIN_PACKAGE: ./cmd/my-app
+
+  # Embedded in the Authenticode signature
+  PUBLISHER_NAME: Example Corp
+  DESCRIPTION: Example App
+  DESCRIPTION_URL: https://example.com
+
+  # Microsoft's Sign CLI
+  SIGN_TOOL_VERSION: 0.9.1-beta.26431.1
+  SIGN_TOOL_EXPECTED_AUTHOR: Microsoft
+  SIGN_TOOL_EXPECTED_REPO: https://github.com/dotnet/sign
+  DOTNET_VERSION: '9.0.x'
+
+  # Explicit: Sign CLI defaults to Microsoft's TSA. Outlives the cert expiry.
+  TIMESTAMP_URL: http://timestamp.digicert.com
+
+jobs:
+  # 1. Build the unsigned binary on Linux.
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build Windows binary
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -o "dist/${BINARY_NAME}" \
+            "${GO_MAIN_PACKAGE}"
+
+      # Not hashed yet: Authenticode rewrites the PE.
+      - name: Upload unsigned binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned
+          path: dist/${{ env.BINARY_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # 2. Authenticode-sign on Windows. Sign CLI cannot sign PE files on Linux.
+  # Keep this GitHub-hosted and ephemeral: a persistent runner could keep the
+  # Azure token cached. No AWS credentials, no checkout. Binary in, signed binary out.
+  sign:
+    name: Authenticode Sign
+    needs: build
+    runs-on: windows-latest
+    # Optional: scope the Azure federated credential to an environment and add
+    # required reviewers to gate signing.
+    # environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download unsigned binary
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned
+          path: dist
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install Sign CLI (pinned and authorship verified)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Authorship first. NuGet versions are immutable; the "sign" ID is not unique.
+          $uri = "https://api.nuget.org/v3-flatcontainer/sign/$env:SIGN_TOOL_VERSION/sign.nuspec"
+          [xml]$nuspec = (Invoke-WebRequest -Uri $uri -UseBasicParsing).Content
+          $authors = $nuspec.package.metadata.authors
+          $repo    = $nuspec.package.metadata.repository.url
+
+          if ($authors -ne $env:SIGN_TOOL_EXPECTED_AUTHOR) {
+            Write-Output "::error::Sign CLI authorship check failed. Expected '$env:SIGN_TOOL_EXPECTED_AUTHOR', got '$authors'."
+            exit 1
+          }
+          if ($repo -ne $env:SIGN_TOOL_EXPECTED_REPO) {
+            Write-Output "::error::Sign CLI repository check failed. Expected '$env:SIGN_TOOL_EXPECTED_REPO', got '$repo'."
+            exit 1
+          }
+          Write-Output "Sign CLI $env:SIGN_TOOL_VERSION authored by '$authors' ($repo)"
+
+          # --version cannot be combined with --prerelease.
+          dotnet tool install sign `
+            --tool-path "$env:RUNNER_TEMP\sign" `
+            --version $env:SIGN_TOOL_VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Azure login for Authenticode signing
+        # SHA-pinned: this action handles the OIDC token that authorises code signing.
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          # The signing identity needs no ARM read, so it cannot enumerate a subscription.
+          allow-no-subscriptions: true
+
+      - name: Authenticode sign the binary
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL }}
+          AZURE_CERT_NAME: ${{ vars.AZURE_CERT_NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Digest-only: the binary stays here, the key stays in the vault. The
+          # azure-cli credential reuses the login, so no token touches a var or argv.
+          & "$env:RUNNER_TEMP\sign\sign.exe" code azure-key-vault `
+            "dist\$env:BINARY_NAME" `
+            --azure-key-vault-url $env:AZURE_KEY_VAULT_URL `
+            --azure-key-vault-certificate $env:AZURE_CERT_NAME `
+            --azure-credential-type azure-cli `
+            --file-digest sha256 `
+            --timestamp-url $env:TIMESTAMP_URL `
+            --timestamp-digest sha256 `
+            --publisher-name $env:PUBLISHER_NAME `
+            --description $env:DESCRIPTION `
+            --description-url $env:DESCRIPTION_URL `
+            --verbosity information
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Revoke Azure credential
+        if: always()
+        shell: pwsh
+        run: az logout 2>$null; exit 0
+
+      - name: Verify the signature on the artifact
+        shell: pwsh
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.EXPECTED_CERT_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "dist\$env:BINARY_NAME"
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+
+          # "Valid" means the chain verified against the Windows root store.
+          if ($sig.Status -ne 'Valid') {
+            Write-Output "::error::Authenticode verification failed: $($sig.Status) - $($sig.StatusMessage)"
+            exit 1
+          }
+
+          # No timestamp means the signature dies when the cert expires.
+          if ($null -eq $sig.TimeStamperCertificate) {
+            Write-Output "::error::Signature is not RFC-3161 timestamped."
+            exit 1
+          }
+
+          # The cert in the binary, not the one in the vault. Catches a swap.
+          $actual = [BitConverter]::ToString(
+            [System.Security.Cryptography.SHA256]::HashData($sig.SignerCertificate.RawData)
+          ).Replace('-','').ToLower()
+          $expected = "$env:EXPECTED_CERT_SHA256".Trim().ToLower()
+          if ($expected -and $actual -ne $expected) {
+            Write-Output "::error::Signing certificate does not match. Expected $expected, got $actual."
+            exit 1
+          }
+
+          Write-Output "Authenticode: Valid"
+          Write-Output "Signer:       $($sig.SignerCertificate.Subject)"
+          Write-Output "Cert SHA-256: $actual"
+          Write-Output "Timestamp CA: $($sig.TimeStamperCertificate.Subject)"
+
+          "### Authenticode"                                          | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "- Status: Valid, chain verified against the Windows store" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "- Signer: ``$($sig.SignerCertificate.Subject)``"           | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "- Certificate SHA-256: ``$actual``"                        | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "- Certificate pinned: $([bool]$expected)"                  | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "- RFC-3161 timestamp: present"                             | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload signed binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed
+          path: dist/${{ env.BINARY_NAME }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # 3. Checksum and publish. Must follow sign: Authenticode rewrites the PE,
+  # so any hash computed before it would match nothing.
+  publish:
+    name: Publish
+    needs: sign
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download signed binary
+        uses: actions/download-artifact@v4
+        with:
+          name: signed
+          path: dist
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload to S3
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          PREFIX="releases/versions/${VERSION}"
+          SHA256=$(sha256sum "dist/${BINARY_NAME}" | awk '{print $1}')
+          SIZE=$(stat -c%s "dist/${BINARY_NAME}")
+
+          aws s3 cp "dist/${BINARY_NAME}" "s3://${S3_BUCKET}/${PREFIX}/${BINARY_NAME}"
+          echo "${SHA256}" > "dist/${BINARY_NAME}.sha256"
+          aws s3 cp "dist/${BINARY_NAME}.sha256" "s3://${S3_BUCKET}/${PREFIX}/${BINARY_NAME}.sha256"
+
+          # Write the "latest" pointer last, after the versioned objects exist.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg sha256 "$SHA256" \
+            --arg key "${PREFIX}/${BINARY_NAME}" \
+            --argjson size "$SIZE" \
+            '{version: $version, sha256: $sha256, s3_key: $key, size_bytes: $size}' > latest.json
+          aws s3 cp latest.json "s3://${S3_BUCKET}/releases/latest.json"
+
+          {
+            echo "### Release ${VERSION}"
+            echo "- **SHA256**: \`${SHA256}\`"
+            echo "- **Size**: ${SIZE} bytes"
+            echo "- **Authenticode**: verified in the sign job"
+          } >> "$GITHUB_STEP_SUMMARY"
